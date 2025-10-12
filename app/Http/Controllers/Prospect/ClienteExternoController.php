@@ -2,61 +2,111 @@
 
 namespace App\Http\Controllers\Prospect;
 
-
-use App\Models\Prospect\ClienteExterno;
-use App\Support\GeoBounds;
+use App\Http\Controllers\Controller;
+use App\Services\FreeEnrichmentService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
-
-class ClienteExternoController
+class ClienteExternoController extends Controller
 {
-public function countInBounds(Request $req)
-{
-    // se all=1, conta geral sem bounds (para debug rápido)
-    if ($req->boolean('all')) {
-        $c = ClienteExterno::on('sqlite_prospect')->count();
-        return response()->json(['count' => $c]);
-    }
-
-    $b = $this->parseBounds($req);
-    if (!$b) return response()->json(['count' => 0]);
-
-    $count = ClienteExterno::on('sqlite_prospect')
-        ->whereBetween('latitude', [$b['s'], $b['n']])
-        ->whereBetween('longitude', [$b['w'], $b['e']])
-        ->count();
-
-    return response()->json(['count' => $count]);
-}
-
-public function listInBounds(Request $req)
-{
-    $all = $req->boolean('all');                      // << NOVO
-    $b = $this->parseBounds($req);
-    $per = min(max((int)$req->query('per_page', 100), 1), 500);
-
-    $q = ClienteExterno::on('sqlite_prospect');
-
-    if (!$all && $b) {                                // << só filtra por bounds se !all
-        $q->whereBetween('latitude', [$b['s'], $b['n']])
-          ->whereBetween('longitude', [$b['w'], $b['e']]);
-    }
-
-    if ($req->filled('cnae')) {
-        $q->where('codigo_cnae', substr(preg_replace('/\D/','', $req->query('cnae')), 0, 7));
-    }
-
-    return response()->json(
-        $q->orderByDesc('enriched_at')->paginate($per)
-    );
-}
-
-
-    private function parseBounds($req): ?array
+    public function buscar(Request $req, FreeEnrichmentService $svc)
     {
-        $bounds = $req->query('bounds');
-        if (is_string($bounds)) $bounds = json_decode($bounds, true);
-        if (!is_array($bounds) || !isset($bounds['n'], $bounds['s'], $bounds['e'], $bounds['w'])) return null;
-        return $bounds;
+        $lat    = (float) $req->get('lat');
+        $lng    = (float) $req->get('lng');
+        $cnae   = (string) $req->get('cnae');
+        $radius = $req->has('radius') ? (int) $req->get('radius') : null;
+
+        if (!$lat || !$lng || !$cnae) {
+            return response()->json(['error' => 'Parâmetros obrigatórios: lat, lng, cnae'], 422);
+        }
+
+        // 1) Coleta clientes internos perto (para excluir)
+        $internos = [];
+        try {
+            $kmBox = 25; // caixa grossa antes do filtro real (suficiente p/ exclusão)
+            $internos = DB::connection('oracle')
+                ->table(env('ORACLE_TABLE', 'VIEW_APP_CLIENTE_MAPA'))
+                ->selectRaw('NOME as nome, CNPJ as cnpj, LATITUDE as lat, LONGITUDE as lng, CNAE as cnae')
+                ->where('CNAE', $cnae)
+                ->whereNotNull('LATITUDE')
+                ->whereNotNull('LONGITUDE')
+                // bounding box simples (aproximação)
+                ->whereBetween('LATITUDE', [$lat - $kmBox * 0.009, $lat + $kmBox * 0.009])
+                ->whereBetween('LONGITUDE', [$lng - $kmBox * 0.009, $lng + $kmBox * 0.009])
+                ->limit(2000)
+                ->get()
+                ->map(fn($r) => [
+                    'nome' => $r->nome,
+                    'cnpj' => $r->cnpj,
+                    'lat'  => (float) $r->lat,
+                    'lng'  => (float) $r->lng,
+                ])
+                ->toArray();
+        } catch (\Throwable $e) {
+            Log::warning('ClienteExternoController: falha ao ler internos', ['err' => $e->getMessage()]);
+        }
+
+        Log::info('ClienteExternoController: internos base p/ exclusão', ['qtd' => count($internos)]);
+
+        // 2) Busca externos (com fallback de raio dentro do serviço)
+        $externos = $svc->buscarPorCnae($lat, $lng, $cnae, $radius, $internos);
+
+        Log::info('ClienteExternoController: externos obtidos do Places', ['qtd' => count($externos)]);
+
+        // 3) Persiste/atualiza no SQLite de prospecção
+        $salvos = 0;
+        foreach ($externos as $p) {
+            try {
+                DB::connection('prospect') // alias no config/database.php apontando p/ DB_PROSPECT_SQLITE
+                    ->table('cliente_externo')
+                    ->updateOrInsert(
+                        ['place_id' => $p['place_id']],
+                        [
+                            'nome'       => $p['nome'],
+                            'endereco'   => $p['endereco'],
+                            'lat'        => $p['lat'],
+                            'lng'        => $p['lng'],
+                            'cnae'       => $cnae,
+                            'fonte'      => 'google_places',
+                            'rating'     => $p['rating'] ?? null,
+                            'tipos'      => !empty($p['types']) ? json_encode($p['types']) : null,
+                            'updated_at' => now(),
+                            'created_at' => now(),
+                        ]
+                    );
+                $salvos++;
+            } catch (\Throwable $e) {
+                Log::warning('ClienteExternoController: falha ao salvar cliente_externo', [
+                    'place_id' => $p['place_id'] ?? null,
+                    'err'      => $e->getMessage(),
+                ]);
+            }
+        }
+
+        Log::info('ClienteExternoController: externos persistidos', ['qtd' => $salvos]);
+
+        // 4) Retorna lista pronta para o mapa
+        $ret = [];
+        try {
+            $ret = DB::connection('prospect')
+                ->table('cliente_externo')
+                ->where('cnae', $cnae)
+                ->orderByDesc('updated_at')
+                ->limit(500)
+                ->get();
+        } catch (\Throwable $e) {
+            Log::warning('ClienteExternoController: erro ao ler cliente_externo', ['err' => $e->getMessage()]);
+        }
+
+        return response()->json([
+            'cnae'       => $cnae,
+            'lat'        => $lat,
+            'lng'        => $lng,
+            'radius'     => $radius,
+            'salvos'     => $salvos,
+            'quantidade' => count($ret),
+            'data'       => $ret,
+        ]);
     }
 }
