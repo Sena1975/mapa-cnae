@@ -1,0 +1,303 @@
+
+diff --git a/routes/api.php b/routes/api.php
+index 0000000..1111111 100644
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -1,15 +1,16 @@
+ <?php
+
+ use Illuminate\Support\Facades\Route;
+ use App\Http\Controllers\Prospect\ClienteExternoController;
+
+-Route::middleware('throttle:60,1')->group(function () {
+-    Route::get('/clientes',  [ClienteExternoController::class, 'listInBounds']);
+-    Route::get('/externos',  [ClienteExternoController::class, 'listInBounds']);
+-    Route::get('/externals', [ClienteExternoController::class, 'listInBounds']);
+-    Route::get('/externals/count', [ClienteExternoController::class, 'countInBounds']);
+-});
++Route::middleware('throttle:40,1')->group(function () {
++    // Listagem e contagem (apenas uma definição de rota para cada)
++    Route::get('/externals',        [ClienteExternoController::class, 'listInBounds']);
++    Route::get('/externals/count',  [ClienteExternoController::class, 'countInBounds']);
++});
+
+diff --git a/app/Http/Requests/ListExternalClientsRequest.php b/app/Http/Requests/ListExternalClientsRequest.php
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/Http/Requests/ListExternalClientsRequest.php
+@@ -0,0 +1,54 @@
++<?php
++namespace App\Http\Requests;
++
++use Illuminate\Foundation\Http\FormRequest;
++
++class ListExternalClientsRequest extends FormRequest
++{
++    public function rules(): array
++    {
++        return [
++            // bounds pode vir como JSON (string) ou como array
++            'bounds'      => ['required'],
++            'bounds.n'    => ['required','numeric'],
++            'bounds.s'    => ['required','numeric'],
++            'bounds.e'    => ['required','numeric'],
++            'bounds.w'    => ['required','numeric'],
++
++            // centro opcional para ordenação por distância
++            'center'      => ['nullable','array'],
++            'center.lat'  => ['nullable','numeric'],
++            'center.lng'  => ['nullable','numeric'],
++
++            // filtros opcionais
++            'cidade'      => ['nullable','string','max:80'],
++            'uf'          => ['nullable','string','size:2'],
++            'cnaes'       => ['nullable','array','max:50'],
++            'cnaes.*'     => ['string','max:20'],
++
++            // paginação e ordenação (inclui distância)
++            'page'        => ['nullable','integer','min:1'],
++            'per_page'    => ['nullable','integer','min:10','max:200'],
++            'sort'        => ['nullable','string','in:enriched_at,-enriched_at,nome,-nome,distance,-distance'],
++        ];
++    }
++}
+diff --git a/app/Models/Prospect/ClienteExterno.php b/app/Models/Prospect/ClienteExterno.php
+index 0000000..1111111 100644
+--- a/app/Models/Prospect/ClienteExterno.php
++++ b/app/Models/Prospect/ClienteExterno.php
+@@ -1,200 +1,120 @@
+ <?php
+ namespace App\Models\Prospect;
+
+ use Illuminate\Database\Eloquent\Model;
+
+ class ClienteExterno extends Model
+ {
+     protected $connection = 'sqlite_prospect';
+     protected $table = 'cliente_externo';
+
+     protected $fillable = [
+         'cnpj','razao_social','nome_fantasia','codigo_cnae','descricao_cnae',
+         'endereco','numero','bairro','cidade','uf','cep','ibge',
+         'latitude','longitude','inscricao_estadual','media_compra_mensal',
+         'source_cnpj','source_endereco','source_geocode','enriched_at'
+     ];
+
+     protected $casts = [
+         'enriched_at' => 'datetime',
+         'latitude' => 'float',
+         'longitude' => 'float',
+     ];
+
+-    // --- Escopos auxiliares ---
+-    public function scopeInBounds($q, float $n, float $s, float $e, float $w)
+-    {
+-        // caixa simples por lat/lng
+-        return $q->whereBetween('latitude',  [$s, $n])
+-                 ->whereBetween('longitude', [$w, $e]);
+-    }
+-
+-    public function scopeFilterLocalidade($q, ?string $cidade, ?string $uf)
+-    {
+-        if ($uf)     $q->where('uf', strtoupper($uf));
+-        if ($cidade) $q->where('cidade', 'like', "%".$cidade."%");
+-        return $q;
+-    }
+-
+-    public function scopeFilterCnaes($q, array $cnaes)
+-    {
+-        if (empty($cnaes)) return $q;
+-        // aceita codigo exato em codigo_cnae (pode adaptar para LIKE prefixo 7 dígitos)
+-        return $q->whereIn('codigo_cnae', array_map('strval', $cnaes));
+-    }
++    // --- Escopos auxiliares ---
++    public function scopeInBounds($q, float $n, float $s, float $e, float $w)
++    {
++        // caixa simples por lat/lng
++        return $q->whereBetween('latitude',  [$s, $n])
++                 ->whereBetween('longitude', [$w, $e]);
++    }
++
++    public function scopeFilterLocalidade($q, ?string $cidade, ?string $uf)
++    {
++        if ($uf)     $q->where('uf', strtoupper($uf));
++        if ($cidade) $q->where('cidade', 'like', "%".$cidade."%");
++        return $q;
++    }
++
++    /**
++     * Filtra por prefixos de CNAE (7 dígitos). Aceita códigos completos ou ruidosos.
++     * Ex.: "47.89-0/01" -> prefixo "4789000"
++     */
++    public function scopeFilterCnaes($q, array $cnaes)
++    {
++        $prefixes = [];
++        foreach ($cnaes as $c) {
++            $digits = preg_replace('/\D/','', (string) $c);
++            if ($digits === '') continue;
++            $prefixes[] = substr($digits, 0, 7); // 7 dígitos
++        }
++        $prefixes = array_values(array_unique(array_filter($prefixes)));
++        if (!$prefixes) return $q;
++
++        return $q->where(function($w) use ($prefixes) {
++            foreach ($prefixes as $i => $p) {
++                $like = $p.'%';
++                $i===0 ? $w->where('codigo_cnae','like',$like)
++                       : $w->orWhere('codigo_cnae','like',$like);
++            }
++        });
++    }
+ }
+diff --git a/app/Http/Resources/ClienteExternoResource.php b/app/Http/Resources/ClienteExternoResource.php
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/Http/Resources/ClienteExternoResource.php
+@@ -0,0 +1,57 @@
++<?php
++namespace App\Http\Resources;
++
++use Illuminate\Http\Resources\Json\JsonResource;
++
++class ClienteExternoResource extends JsonResource
++{
++    public function toArray($req)
++    {
++        $center = $req->input('center');
++        $distanceKm = null;
++        if (is_array($center) && isset($center['lat'],$center['lng']) && $this->latitude !== null && $this->longitude !== null) {
++            $distanceKm = $this->haversineKm((float)$center['lat'], (float)$center['lng'], (float)$this->latitude, (float)$this->longitude);
++        }
++
++        return [
++            'cnpj'           => $this->cnpj,
++            'razao_social'   => $this->razao_social,
++            'nome_fantasia'  => $this->nome_fantasia,
++            'codigo_cnae'    => $this->codigo_cnae,
++            'descricao_cnae' => $this->descricao_cnae,
++            'cidade'         => $this->cidade,
++            'uf'             => $this->uf,
++            'latitude'       => $this->latitude,
++            'longitude'      => $this->longitude,
++            'enriched_at'    => optional($this->enriched_at)->toIso8601String(),
++            'distance_km'    => $distanceKm,
++        ];
++    }
++
++    private function haversineKm(float $lat1, float $lng1, float $lat2, float $lng2): float
++    {
++        $R = 6371.0; // km
++        $dLat = deg2rad($lat2 - $lat1);
++        $dLng = deg2rad($lng2 - $lng1);
++        $a = sin($dLat/2)**2 + cos(deg2rad($lat1)) * cos(deg2rad($lat2)) * sin($dLng/2)**2;
++        $c = 2 * atan2(sqrt($a), sqrt(1-$a));
++        return round($R * $c, 3);
++    }
++}
+diff --git a/app/Http/Controllers/Prospect/ClienteExternoController.php b/app/Http/Controllers/Prospect/ClienteExternoController.php
+index 0000000..1111111 100644
+--- a/app/Http/Controllers/Prospect/ClienteExternoController.php
++++ b/app/Http/Controllers/Prospect/ClienteExternoController.php
+@@ -1,200 +1,120 @@
+ <?php
+ namespace App\Http\Controllers\Prospect;
+
+ use App\Models\Prospect\ClienteExterno;
+ use App\Http\Requests\ListExternalClientsRequest;
+ use App\Http\Resources\ClienteExternoResource;
+ use Illuminate\Http\Request;
+
+ class ClienteExternoController
+ {
+-    public function listInBounds(Request $req)
+-    {
+-        // ...
+-    }
++    public function listInBounds(ListExternalClientsRequest $req)
++    {
++        $data   = $req->validated();
++        $bounds = is_string($data['bounds']) ? json_decode($data['bounds'], true) : $data['bounds'];
++        $n = (float)$bounds['n']; $s = (float)$bounds['s'];
++        $e = (float)$bounds['e']; $w = (float)$bounds['w'];
++
++        $per   = $data['per_page'] ?? 50;
++        $sort  = $data['sort'] ?? 'enriched_at';
++
++        // Centro: fornecido ou média dos bounds
++        $centerLat = $data['center']['lat'] ?? (($n + $s) / 2);
++        $centerLng = $data['center']['lng'] ?? (($e + $w) / 2);
++        $cosLat0   = cos(deg2rad($centerLat)); // constante para dist2
++
++        $q = ClienteExterno::query()
++            ->inBounds($n, $s, $e, $w)
++            ->filterLocalidade($data['cidade'] ?? null, $data['uf'] ?? null)
++            ->when(!empty($data['cnaes']), fn($q) => $q->filterCnaes($data['cnaes']));
++
++        // Ordenação por distância (aproximação dist2) quando solicitado
++        if (in_array($sort, ['distance','-distance'])) {
++            $dist2Expr = '((latitude - ?) * (latitude - ?)) + (((longitude - ?) * ?) * ((longitude - ?) * ?))';
++            $bindings = [$centerLat, $centerLat, $centerLng, $cosLat0, $centerLng, $cosLat0];
++            $dir = $sort === 'distance' ? 'asc' : 'desc';
++            $q->addSelectRaw($dist2Expr.' as dist2', $bindings)->orderByRaw('dist2 '.$dir);
++        } else {
++            $sortMap = [
++                'enriched_at'  => ['enriched_at','desc'],
++                '-enriched_at' => ['enriched_at','asc'],
++                'nome'         => ['nome_fantasia','asc'],
++                '-nome'        => ['nome_fantasia','desc'],
++            ];
++            [$col,$dir] = $sortMap[$sort] ?? ['enriched_at','desc'];
++            $q->orderBy($col, $dir);
++        }
++
++        // Passa o center para o Resource calcular distance_km (Haversine) com precisão
++        request()->merge(['center' => ['lat' => $centerLat, 'lng' => $centerLng]]);
++
++        return ClienteExternoResource::collection($q->paginate($per));
++    }
+
+     public function countInBounds(Request $req)
+     {
+         if ($req->boolean('all')) {
+             return response()->json(['count' => ClienteExterno::query()->count()]);
+         }
+         $bounds = $req->query('bounds');
+         if (is_string($bounds)) $bounds = json_decode($bounds, true);
+         if (!is_array($bounds) || !isset($bounds['n'],$bounds['s'],$bounds['e'],$bounds['w'])) {
+             return response()->json(['message' => 'bounds inválido'], 422);
+         }
+         $n=(float)$bounds['n']; $s=(float)$bounds['s']; $e=(float)$bounds['e']; $w=(float)$bounds['w'];
+         $q = ClienteExterno::query()->inBounds($n,$s,$e,$w)
+             ->filterLocalidade($req->query('cidade'), $req->query('uf'));
+         $cnaes = (array) $req->query('cnaes', []);
+-        if (!empty($cnaes)) $q->whereIn('codigo_cnae', $cnaes);
++        if (!empty($cnaes)) $q->filterCnaes($cnaes);
+         return response()->json(['count' => $q->count()]);
+     }
+ }
+diff --git a/database/migrations/2025_10_10_130000_idx_cnae_prefix_cliente_externo.php b/database/migrations/2025_10_10_130000_idx_cnae_prefix_cliente_externo.php
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/database/migrations/2025_10_10_130000_idx_cnae_prefix_cliente_externo.php
+@@ -0,0 +1,20 @@
++<?php
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Support\Facades\DB;
++
++return new class extends Migration {
++    public function up(): void
++    {
++        DB::connection('sqlite_prospect')->statement(
++            "CREATE INDEX IF NOT EXISTS idx_cli_ext_cnae_prefix ON cliente_externo(substr(codigo_cnae,1,7))"
++        );
++    }
++    public function down(): void
++    {
++        DB::connection('sqlite_prospect')->statement(
++            "DROP INDEX IF EXISTS idx_cli_ext_cnae_prefix"
++        );
++    }
++};
