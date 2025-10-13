@@ -9,7 +9,8 @@ public function up(): void
 {
 Schema::connection('sqlite_prospect')->create('cliente_externo', function (Blueprint $table) {
 $table->id();
-$table->string('cnpj', 14)->unique();
+$table->string('cnpj', 14)->nullable()->unique();
+$table->string('place_id')->nullable()->unique();
 $table->string('razao_social')->nullable();
 $table->string('nome_fantasia')->nullable();
 $table->string('codigo_cnae', 7)->nullable();
