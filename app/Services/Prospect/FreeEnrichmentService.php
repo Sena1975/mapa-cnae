@@ -1,6 +1,7 @@
 <?php
 
-namespace App\Services;
+namespace app\Services\Prospect;
+
 
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;

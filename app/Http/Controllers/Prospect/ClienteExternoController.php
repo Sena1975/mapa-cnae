@@ -3,7 +3,7 @@
 namespace App\Http\Controllers\Prospect;
 
 use App\Http\Controllers\Controller;
-use App\Services\FreeEnrichmentService;
+use App\Services\Prospect\FreeEnrichmentService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
